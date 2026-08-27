@@ -1,0 +1,23 @@
+// kernelcache.hpp - umbrella public header for the KernelCache library.
+#pragma once
+
+#include "kernelcache/result.hpp"
+#include "kernelcache/identifiers.hpp"
+#include "kernelcache/descriptors.hpp"
+#include "kernelcache/sha256.hpp"
+#include "kernelcache/canonical.hpp"
+#include "kernelcache/key.hpp"
+#include "kernelcache/compatibility.hpp"
+#include "kernelcache/lifecycle.hpp"
+#include "kernelcache/artifact.hpp"
+#include "kernelcache/backend.hpp"
+#include "kernelcache/lookup.hpp"
+#include "kernelcache/invalidation.hpp"
+#include "kernelcache/residency.hpp"
+#include "kernelcache/persistence.hpp"
+#include "kernelcache/stats.hpp"
+#include "kernelcache/explain.hpp"
+#include "kernelcache/clock.hpp"
+#include "kernelcache/log.hpp"
+#include "kernelcache/kernel_cache.hpp"
+#include "kernelcache/version.hpp"

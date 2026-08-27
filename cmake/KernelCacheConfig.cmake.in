@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# KernelCache is self-contained; the CPU path has no external runtime link
+# dependencies. The CUDA backend links the CUDA driver dynamically, so no CUDA
+# CMake target is required by downstream consumers.
+set(KernelCache_CUDA_BACKEND "@KERNELCACHE_CUDA@")
+set(KernelCache_VERSION "@PROJECT_VERSION@")
+
+include("${CMAKE_CURRENT_LIST_DIR}/KernelCacheTargets.cmake")
+
+check_required_components(KernelCache)
