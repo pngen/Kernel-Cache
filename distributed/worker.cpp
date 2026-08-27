@@ -70,7 +70,7 @@ int main(int argc, char** argv) {
         req.namespace_ = ns;
         auto l = cache.acquire(req);
         if (l.ok()) { id = l.value().artifact_id(); gen = l.value().generation(); l.value().release(); }
-        else { errcode = static_cast<std::uint32_t>(ErrorCode::BuildFailed); err = l.error().message(); }
+        else { errcode = static_cast<std::uint32_t>(ErrorCode::BuildFailed); err = l.error().message(); std::fprintf(stderr, "worker[%llu] build FAIL code=%s msg='%s'\n", (unsigned long long)worker_id, error_code_name(l.error().code()), l.error().message().c_str()); }
       }
     }
     auto resp = encode_build_response(rid, id, gen, errcode, err);

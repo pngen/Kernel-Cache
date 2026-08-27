@@ -18,6 +18,8 @@ const char* dist_msg_type_name(DistMsgType t) noexcept {
     case DistMsgType::RollEpochAck: return "roll-epoch-ack";
     case DistMsgType::EpochInvalid: return "epoch-invalid";
     case DistMsgType::Shutdown: return "shutdown";
+    case DistMsgType::QueryWorkers: return "query-workers";
+    case DistMsgType::QueryWorkersResp: return "query-workers-resp";
   }
   return "unknown";
 }
@@ -63,7 +65,7 @@ Result<std::pair<DistMsgType, std::vector<std::uint8_t>>> decode_frame(std::span
   if (ver != kDistProtoVersion) return Result<std::pair<DistMsgType, std::vector<std::uint8_t>>>(ErrorCode::ProtocolVersionMismatch, "unsupported protocol version");
   DistMsgType type = static_cast<DistMsgType>(type16);
   bool known = false;
-  for (auto t : {DistMsgType::Hello_W, DistMsgType::Register_W, DistMsgType::RegisterAck_C, DistMsgType::LookupReq, DistMsgType::LookupResp, DistMsgType::BuildReq, DistMsgType::BuildResp, DistMsgType::InvalidateReq, DistMsgType::InvalidateResp, DistMsgType::RollEpoch, DistMsgType::RollEpochAck, DistMsgType::EpochInvalid, DistMsgType::Shutdown}) if (t == type) known = true;
+  for (auto t : {DistMsgType::Hello_W, DistMsgType::Register_W, DistMsgType::RegisterAck_C, DistMsgType::LookupReq, DistMsgType::LookupResp, DistMsgType::BuildReq, DistMsgType::BuildResp, DistMsgType::InvalidateReq, DistMsgType::InvalidateResp, DistMsgType::RollEpoch, DistMsgType::RollEpochAck, DistMsgType::EpochInvalid, DistMsgType::Shutdown, DistMsgType::QueryWorkers, DistMsgType::QueryWorkersResp}) if (t == type) known = true;
   if (!known) return Result<std::pair<DistMsgType, std::vector<std::uint8_t>>>(ErrorCode::UnknownMessageType, "unknown message type");
   std::vector<std::uint8_t> payload(frame.begin() + kDistHeaderBytes, frame.end());
   return std::make_pair(type, std::move(payload));
@@ -238,4 +240,29 @@ Result<void> decode_roll_epoch(const std::vector<std::uint8_t>& p, CoordinatorEp
   } catch (const CursorDead&) { return Result<void>(ErrorCode::MalformedFrame, "truncated roll-epoch"); }
 }
 
+
+std::vector<std::uint8_t> encode_query_workers() {
+  std::vector<std::uint8_t> out;
+  out.push_back('Q'); out.push_back('W');
+  return out;
+}
+Result<std::vector<std::uint64_t>> decode_query_workers(const std::vector<std::uint8_t>& p) {
+  if (p.size() < 2 || p[0] != 'Q' || p[1] != 'W') return Result<std::vector<std::uint64_t>>(ErrorCode::MalformedFrame, "bad query marker");
+  return std::vector<std::uint64_t>{};
+}
+std::vector<std::uint8_t> encode_query_workers_resp(const std::vector<std::uint64_t>& boot_his) {
+  std::vector<std::uint8_t> out;
+  out.push_back(0x51u); out.push_back(0x52u);
+  for (auto h : boot_his) append_u64_be(out, h);
+  return out;
+}
+Result<std::vector<std::uint64_t>> decode_query_workers_resp(const std::vector<std::uint8_t>& p) {
+  std::vector<std::uint64_t> out;
+  try {
+    Reader r{p.data(), p.size(), 0};
+    if (r.u8() != 0x51u || r.u8() != 0x52u) return Result<std::vector<std::uint64_t>>(ErrorCode::MalformedFrame, "bad resp marker");
+    while (r.i < r.n) out.push_back(r.u64());
+  } catch (const CursorDead&) { return Result<std::vector<std::uint64_t>>(ErrorCode::MalformedFrame, "truncated resp"); }
+  return out;
+}
 }  // namespace kernelcache

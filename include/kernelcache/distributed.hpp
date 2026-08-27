@@ -31,6 +31,8 @@ enum class DistMsgType : std::uint16_t {
   RollEpochAck = 11,    // worker -> coordinator
   EpochInvalid = 12,    // coordinator -> worker (epoch changed)
   Shutdown = 13,
+  QueryWorkers = 14,        // client -> coordinator: list registered workers
+  QueryWorkersResp = 15,    // coordinator -> client: registered worker boot-hi list
 };
 
 const char* dist_msg_type_name(DistMsgType t) noexcept;
@@ -103,5 +105,11 @@ Result<void> decode_register_ack(const std::vector<std::uint8_t>& p, Coordinator
 
 std::vector<std::uint8_t> encode_roll_epoch(CoordinatorEpoch epoch);
 Result<void> decode_roll_epoch(const std::vector<std::uint8_t>& p, CoordinatorEpoch& epoch);
+
+// Worker query: ask the coordinator which worker boots are currently registered.
+std::vector<std::uint8_t> encode_query_workers();
+Result<std::vector<std::uint64_t>> decode_query_workers(const std::vector<std::uint8_t>& p);
+std::vector<std::uint8_t> encode_query_workers_resp(const std::vector<std::uint64_t>& boot_his);
+Result<std::vector<std::uint64_t>> decode_query_workers_resp(const std::vector<std::uint8_t>& p);
 
 }  // namespace kernelcache

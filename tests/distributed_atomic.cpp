@@ -160,18 +160,30 @@ int main(int argc, char** argv) {
   std::uint8_t replayed_boot = lookup(conn, oldboot, RequestId(9,12), keyR);  // dispatch -> worker rejects stale boot
   CHECK_EQ(replayed_boot, 0x0F);
 
-  // Step 6: fresh work under current authority succeeds.
+  // Step 6: deterministically wait for the restarted worker (new boot 0xAAAA) to be
+  // registered, then assert fresh post-restart work SUCCEEDS under current authority.
+  {
+    bool registered = false;
+    for (int i = 0; i < 300 && !registered; ++i) {
+      conn.write_frame(static_cast<std::uint16_t>(DistMsgType::QueryWorkers), encode_query_workers());
+      std::uint16_t qt; std::vector<std::uint8_t> qp;
+      if (conn.read_frame(qt, qp) && qt == static_cast<std::uint16_t>(DistMsgType::QueryWorkersResp)) {
+        auto boots = decode_query_workers_resp(qp);
+        if (boots) for (auto b : boots.value()) if (b == 0xAAAAull) registered = true;
+      }
+      if (!registered) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK_TRUE(registered);   // the restarted worker (new WorkerBootId) is registered
+  }
   DistAuthority fresh = make_auth(2, 2, 0xAAAA, 0xBBBB);
   auto keyC = make_key("opC", 8192);
-  (void)lookup(conn, fresh, RequestId(2,1), keyC);
-  std::uint8_t fresh_out = lookup(conn, fresh, RequestId(2,2), keyC);
-  std::fprintf(stderr, "atomic: fresh authority build outcome=0x%X\n", fresh_out);
-
-  // The fresh authority build outcome is reported rather than asserted, because the
-  // post-restart worker socket lifetime can be timing dependent; the deterministic
-  // stale-authority rejections above are the authoritative assertions.
-  std::uint8_t fresh_out2 = lookup(conn, fresh, RequestId(2,2), keyC);
-  std::fprintf(stderr, "atomic: second fresh lookup outcome=0x%X\n", fresh_out2);
+  std::uint8_t fresh_out = 0x0B;
+  for (int i = 0; i < 5 && fresh_out != 0x00; ++i) {
+    fresh_out = lookup(conn, fresh, RequestId(2, 1 + i), keyC);
+  }
+  CHECK_EQ(fresh_out, 0x00);
+  std::uint8_t fresh_out2 = lookup(conn, fresh, RequestId(2, 9), keyC);
+  CHECK_EQ(fresh_out2, 0x00);
 
   conn.close();
 
