@@ -1,11 +1,8 @@
 Kernel Cache
 
-Copyright (c) Summon Software Labs
+Copyright © Summon Software Labs
 
-Kernel Cache is an open-source, vendor-neutral runtime for caching compiled and
-executable AI kernels, compatibility-safe lookup, reuse, invalidation, residency,
-persistence, and accelerator-aware dispatch across heterogeneous inference
-infrastructure.
+Kernel Cache is an open-source, vendor-neutral runtime for caching compiled and executable AI kernels, compatibility-safe lookup, reuse, invalidation, residency, persistence, and accelerator-aware dispatch across heterogeneous inference infrastructure.
 
 This product is licensed under the Apache License, Version 2.0. See the
 LICENSE file in this distribution for the full license text.
@@ -14,8 +11,6 @@ Kernel Cache does not collect or transmit any telemetry. All telemetry is
 written to local files chosen by the operator and never leaves the machine
 running the software.
 
-Kernel Cache accepts contributions from individuals and organizations on
-the terms of the Apache License 2.0 without requiring a Contributor License
+Kernel Cache accepts contributions from individuals and organizations on the
+terms of the Apache License 2.0 without requiring a Contributor License
 Agreement (CLA). See CONTRIBUTING.md for contribution guidance.
-
-No telemetry transmission.
