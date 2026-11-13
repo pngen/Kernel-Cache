@@ -79,11 +79,11 @@ struct KernelCache::Impl {
   Result<KernelLease> grant_lease(const std::shared_ptr<internal::ArtifactRecord>& rec,
                                   KernelLookupRequest& request);
   void on_lease_release(const std::shared_ptr<internal::ArtifactRecord>& rec,
-                        std::uint64_t load_gen_value);
+                        std::uint64_t load_gen_value, bool pinned);
 
   // --- management ----------------------------------------------------------
   Result<std::vector<InvalidationOutcome>> invalidate_impl(const InvalidationRequest& req);
-  Result<void> evict_impl(const ArtifactId& id, bool force);
+  Result<void> evict_impl(const ArtifactId& id, bool force, bool device_only = false);
   Result<void> pin_impl(const ArtifactId& id);
   Result<void> unpin_impl(const ArtifactId& id);
   std::pair<ArtifactId, std::string> pick_eviction_locked(ResidencyTier tier);

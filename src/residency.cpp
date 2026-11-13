@@ -53,17 +53,32 @@ Result<void> KernelCache::Impl::promote_to_tier(const std::shared_ptr<ArtifactRe
     auto h = ld->loader->load(rec->key, bytes.value(), device);
     if (!h) return Result<void>(h.error().code(), h.error().message());
     auto fp = ld->loader->resident_footprint(h.value());
+    bool installed = false;
+    bool stale = false;
     {
       std::lock_guard<std::shared_mutex> lk(mtx_);
-      rec->native_handle = h.value();
-      rec->load_generation = LoadGeneration(rec->load_generation.value + 1);
-      rec->residency_generation = ResidencyGeneration(rec->residency_generation.value + 1);
-      rec->device_footprint = fp.first;
-      rec->device_footprint_estimated = fp.second;
-      rec->device_bytes_used = fp.first;
-      if (can_transition(rec->state, ArtifactState::ResidentDevice)) rec->state = ArtifactState::ResidentDevice;
-      rec->tier = ResidencyTier::DeviceResident;
-      bump([&](Stats& s){ ++s.active_device_loads; });
+      // While the module loaded outside the lock the record may have been
+      // invalidated, claimed for eviction, or loaded by a concurrent promotion.
+      // Never resurrect or overwrite device state; unload the redundant module.
+      if (rec->invalidated_ || rec->corrupt_ || !kernelcache::is_eligible(rec->state)) {
+        stale = true;
+      } else if (rec->tier != ResidencyTier::DeviceResident) {
+        rec->native_handle = h.value();
+        rec->load_generation = LoadGeneration(rec->load_generation.value + 1);
+        rec->residency_generation = ResidencyGeneration(rec->residency_generation.value + 1);
+        rec->device_footprint = fp.first;
+        rec->device_footprint_estimated = fp.second;
+        rec->device_bytes_used = fp.first;
+        if (can_transition(rec->state, ArtifactState::ResidentDevice)) rec->state = ArtifactState::ResidentDevice;
+        rec->tier = ResidencyTier::DeviceResident;
+        bump([&](Stats& s){ ++s.active_device_loads; });
+        installed = true;
+      }
+    }
+    if (!installed) {
+      (void)ld->loader->unload(h.value());
+      if (stale) return Result<void>(ErrorCode::StaleArtifact, "artifact became ineligible while loading");
+      return Result<void>();
     }
     record_event("promote", "id=" + rec->id.str() + " to device");
     evict_to_fit(ResidencyTier::DeviceResident);
@@ -74,6 +89,12 @@ Result<void> KernelCache::Impl::promote_to_tier(const std::shared_ptr<ArtifactRe
     auto bytes = ensure_bytes(rec);
     if (!bytes) return Result<void>(bytes.error().code(), bytes.error().message());
     std::lock_guard<std::shared_mutex> lk(mtx_);
+    if (rec->invalidated_ || rec->corrupt_ || !kernelcache::is_eligible(rec->state))
+      return Result<void>(ErrorCode::StaleArtifact, "artifact became ineligible while loading");
+    // A concurrent promotion may already have made it host- or device-resident;
+    // never demote it. Restore host bytes an eviction freed meanwhile.
+    if (rec->tier >= ResidencyTier::HostResident) return Result<void>();
+    if (rec->bytes.empty()) rec->bytes = bytes.value();
     rec->tier = ResidencyTier::HostResident;
     if (can_transition(rec->state, ArtifactState::ResidentHost)) rec->state = ArtifactState::ResidentHost;
     rec->residency_generation = ResidencyGeneration(rec->residency_generation.value + 1);
@@ -114,8 +135,8 @@ void KernelCache::Impl::evict_to_fit(ResidencyTier tier) {
     {
       std::lock_guard<std::shared_mutex> lk(mtx_);
       for (auto& [id, rec] : by_id) {
-        if (rec->pin_count > 0 || rec->lease_count > 0) continue;
-        if (rec->invalidated_ || rec->corrupt_) continue;
+        // Every resident artifact counts against the budget; only unpinned,
+        // unleased, healthy, eligible ones may be chosen as victims.
         if (tier == ResidencyTier::DeviceResident) {
           used += rec->device_footprint;
           if (rec->tier != ResidencyTier::DeviceResident) continue;
@@ -123,13 +144,18 @@ void KernelCache::Impl::evict_to_fit(ResidencyTier tier) {
           if (rec->tier != ResidencyTier::HostResident && rec->tier != ResidencyTier::DeviceResident) continue;
           used += rec->desc.sizes.host_bytes;
         }
+        if (rec->pin_count > 0 || rec->lease_count > 0) continue;
+        if (rec->invalidated_ || rec->corrupt_) continue;
+        if (!kernelcache::is_eligible(rec->state)) continue;
         auto s = compute_eviction_score(*rec, now_ns(), cfg.residency);
         if (s.total > best_score) { best_score = s.total; vid = id; victim = rec; }
       }
       if (!victim) return;
       if (used <= budget) return;
     }
-    (void)evict_impl(vid, false);
+    // Stop if the victim could not be evicted (claimed concurrently) rather
+    // than selecting it again.
+    if (!evict_impl(vid, false)) return;
   }
 }
 

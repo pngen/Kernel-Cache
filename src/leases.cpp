@@ -15,6 +15,7 @@ struct KernelLease::State {
   std::shared_ptr<ArtifactRecord> rec;
   std::uint64_t gen_value = 0;
   std::uint64_t load_gen_value = 0;
+  bool pinned = false;   // request.pin: the pin is held only for the lease's duration
   std::atomic<bool> released{false};
 };
 
@@ -44,6 +45,13 @@ Result<KernelLease> KernelCache::Impl::grant_lease(const std::shared_ptr<Artifac
     if (rec->invalidated_ || rec->corrupt_ || !kernelcache::is_eligible(rec->state)) {
       return Result<KernelLease>(ErrorCode::StaleArtifact, "artifact no longer eligible at lease time");
     }
+    // An eviction may have demoted the record after it was promoted for this
+    // request; the lease would then carry no resident module.
+    if ((request.desired_tier == ResidencyTier::HostResident ||
+         request.desired_tier == ResidencyTier::DeviceResident) &&
+        rec->tier < request.desired_tier) {
+      return Result<KernelLease>(ErrorCode::StaleArtifact, "artifact evicted below the requested tier before lease");
+    }
     ++rec->lease_count;
     ++rec->access_count;
     rec->last_access_ns = now_ns();
@@ -54,6 +62,7 @@ Result<KernelLease> KernelCache::Impl::grant_lease(const std::shared_ptr<Artifac
       rec->state = ArtifactState::InUse;
     }
     if (request.pin) ++rec->pin_count;
+    st->pinned = request.pin;
     st->gen_value = rec->generation.value;
     st->load_gen_value = rec->load_generation.value;
     bump([&](Stats& s){ ++s.active_leases; });
@@ -86,7 +95,7 @@ void KernelLease::release() {
   KernelCache::Impl* impl = state_->impl;
   auto rec = state_->rec;
   auto lgv = state_->load_gen_value;
-  if (impl && rec) impl->on_lease_release(rec, lgv);
+  if (impl && rec) impl->on_lease_release(rec, lgv, state_->pinned);
   state_.reset();
 }
 

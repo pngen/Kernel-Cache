@@ -12,6 +12,21 @@ kc_add_test(kc_property property.cpp)
 kc_add_test(kc_persistence persistence_recovery.cpp)
 kc_add_test(kc_cuda cuda.cpp)
 kc_add_test(kc_dist_protocol dist_protocol.cpp)
+kc_add_test(kc_regression regression.cpp)
+
+if(KERNELCACHE_BUILD_DISTRIBUTED)
+  # Coordinator regression scenarios (spawn the coordinator + worker exes).
+  add_executable(kc_dist_regression dist_regression.cpp)
+  target_link_libraries(kc_dist_regression PRIVATE KernelCache)
+  target_include_directories(kc_dist_regression PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../distributed
+  )
+  target_compile_definitions(kc_dist_regression PRIVATE
+    KC_DIST_DIR="${CMAKE_BINARY_DIR}/distributed"
+  )
+  add_test(NAME kc_dist_regression COMMAND kc_dist_regression)
+endif()
 
 # Atomic multiprocess stale-authority proof (needs coordinator + worker exes).
 add_executable(kc_dist_atomic distributed_atomic.cpp)

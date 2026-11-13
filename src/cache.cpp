@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <filesystem>
 #include <sstream>
 #include <thread>
@@ -30,6 +31,16 @@ ArtifactId derive_artifact_id(const std::vector<std::uint8_t>& bytes, ArtifactGe
 std::uint64_t now_ns() {
   auto t = std::chrono::steady_clock::now().time_since_epoch();
   return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t).count());
+}
+// Detach a record's loaded device module so that exactly one caller unloads it,
+// outside the master lock. The caller holds mtx_.
+LoadedModuleHandle take_device_state(ArtifactRecord& r) {
+  LoadedModuleHandle h = std::move(r.native_handle);
+  r.native_handle.reset();
+  r.device_footprint = 0;
+  if (r.tier == ResidencyTier::DeviceResident)
+    r.tier = r.persistent ? ResidencyTier::PersistentStorage : ResidencyTier::MetadataOnly;
+  return h;
 }
 }  // namespace
 
@@ -209,7 +220,7 @@ Result<KernelLookupResult> KernelCache::Impl::lookup_impl(KernelLookupRequest re
 // future. The backend build/validate runs outside every cache lock.
 // ---------------------------------------------------------------------------
 Result<ArtifactDescriptor> KernelCache::Impl::build_impl(KernelLookupRequest request, bool* is_owner) {
-  request.key.finalize();
+  if (!request.key.finalize()) return Result<ArtifactDescriptor>(ErrorCode::InvalidArgument, "key not finalizable");
   if (request.namespace_.empty()) request.namespace_ = cfg.namespace_;
   std::shared_ptr<BuildFence> fence;
   ArtifactGeneration target_gen{0};
@@ -236,7 +247,32 @@ Result<ArtifactDescriptor> KernelCache::Impl::build_impl(KernelLookupRequest req
     }
   }
   if (owner) {
-    auto outc = run_build(request, target_gen, attempt);
+    // Index the artifact before the fence is resolved, so a released waiter (or
+    // a request arriving after the fence is erased) finds it. A throwing backend
+    // still resolves the fence; otherwise its waiters and every later build of
+    // the key would wait on it forever.
+    internal::BuildFence::Outcome outc;
+    bool new_record = false;
+    try {
+      outc = run_build(request, target_gen, attempt);
+      if (outc.succeeded) {
+        std::lock_guard<std::shared_mutex> lk(mtx_);
+        if (!by_id.count(outc.id)) {
+          auto rec = make_record(outc.desc, outc.bytes);
+          rec->desc = outc.desc;
+          insert_index_locked(rec);
+          new_record = true;
+        }
+      }
+    } catch (const std::exception& e) {
+      outc.succeeded = false;
+      outc.error_code = ErrorCode::BuildFailed;
+      outc.error = std::string("build raised an exception: ") + e.what();
+    } catch (...) {
+      outc.succeeded = false;
+      outc.error_code = ErrorCode::BuildFailed;
+      outc.error = "build raised an exception";
+    }
     bump([&](Stats& s){ if (s.active_builds > 0) --s.active_builds; });
     fence->promise.set_value(outc);
     {
@@ -251,16 +287,6 @@ Result<ArtifactDescriptor> KernelCache::Impl::build_impl(KernelLookupRequest req
       return Result<ArtifactDescriptor>(outc.error_code, outc.error);
     }
     record_event("build", "succeeded attempt=" + attempt.str() + " id=" + outc.id.str());
-    bool new_record = false;
-    {
-      std::lock_guard<std::shared_mutex> lk(mtx_);
-      if (!by_id.count(outc.id)) {
-        auto rec = make_record(outc.desc, outc.bytes);
-        rec->desc = outc.desc;
-        insert_index_locked(rec);
-        new_record = true;
-      }
-    }
     if (new_record && persistence_open && persistence) {
       // Persist outside the master lock.
       StoredArtifact sa;
@@ -278,10 +304,14 @@ Result<ArtifactDescriptor> KernelCache::Impl::build_impl(KernelLookupRequest req
       if (pr) {
         std::lock_guard<std::shared_mutex> lk(mtx_);
         auto rit = by_id.find(outc.id);
-        if (rit != by_id.end()) { rit->second->persistent = true; rit->second->tier = ResidencyTier::PersistentStorage; }
+        // Released waiters may already have promoted the record; persisting
+        // must not demote that residency.
+        if (rit != by_id.end()) {
+          rit->second->persistent = true;
+          if (rit->second->tier < ResidencyTier::PersistentStorage) rit->second->tier = ResidencyTier::PersistentStorage;
+        }
         bump([&](Stats& s){ s.bytes_persisted += sa.bytes.size(); });
       } else {
-        std::lock_guard<std::mutex> lk(stats_mtx_);
         record_event("persist", "failed " + pr.error().message());
       }
     }
@@ -338,14 +368,25 @@ Result<KernelLease> KernelCache::Impl::acquire_impl(KernelLookupRequest request)
 // Release accounting: idempotent, never underflows.
 // ---------------------------------------------------------------------------
 void KernelCache::Impl::on_lease_release(const std::shared_ptr<ArtifactRecord>& rec,
-                                         std::uint64_t load_gen_value) {
+                                         std::uint64_t load_gen_value, bool pinned) {
   (void)load_gen_value;
-  std::lock_guard<std::shared_mutex> lk(mtx_);
-  if (rec->lease_count > 0) --rec->lease_count;
-  if (rec->lease_count == 0 && (rec->invalidated_ || rec->corrupt_)) {
-    if (can_transition(rec->state, ArtifactState::Retired)) rec->state = ArtifactState::Retired;
+  LoadedModuleHandle retired_module;
+  {
+    std::lock_guard<std::shared_mutex> lk(mtx_);
+    if (rec->lease_count > 0) --rec->lease_count;
+    // A lease taken with request.pin pins only for its own duration.
+    if (pinned && rec->pin_count > 0) --rec->pin_count;
+    if (rec->lease_count == 0 && (rec->invalidated_ || rec->corrupt_)) {
+      if (can_transition(rec->state, ArtifactState::Retired)) rec->state = ArtifactState::Retired;
+      // The last lease drained: retire the loaded device state now.
+      retired_module = take_device_state(*rec);
+    }
+    bump([&](Stats& s){ if (s.active_leases > 0) --s.active_leases; });
   }
-  bump([&](Stats& s){ if (s.active_leases > 0) --s.active_leases; });
+  if (retired_module) {
+    auto ld = find_backend(rec->key);
+    if (ld && ld->loader) (void)ld->loader->unload(retired_module);
+  }
 }
 // ---------------------------------------------------------------------------
 // Management: invalidation, eviction, pinning, listing, snapshot, explain.
@@ -355,6 +396,7 @@ Result<std::vector<InvalidationOutcome>> KernelCache::Impl::invalidate_impl(cons
   // breaking an executing handle; it is recognized but demoted to a drain.
   std::vector<InvalidationOutcome> outcomes;
   std::vector<ArtifactId> target_ids;
+  std::vector<std::pair<std::shared_ptr<ArtifactRecord>, LoadedModuleHandle>> retired_modules;
   {
     std::lock_guard<std::shared_mutex> lk(mtx_);
     for (auto& [id, rec] : by_id) {
@@ -409,7 +451,9 @@ Result<std::vector<InvalidationOutcome>> KernelCache::Impl::invalidate_impl(cons
         if (can_transition(rec->state, ArtifactState::Invalidated)) rec->state = ArtifactState::Invalidated;
       }
       // Block new leases immediately. Active leases drain; when the last drains,
-      // on_lease_release retires the record.
+      // on_lease_release retires the record. Without leases the safe point is
+      // now: retire the loaded device state.
+      if (rec->lease_count == 0 && rec->native_handle) retired_modules.emplace_back(rec, take_device_state(*rec));
       InvalidationOutcome o; o.target = req.target; o.applied = true; o.hard = req.hard;
       o.affected_ids.push_back(id); o.affected = 1;
       o.message = "invalidated (lease_count=" + std::to_string(rec->lease_count) + ")";
@@ -417,51 +461,78 @@ Result<std::vector<InvalidationOutcome>> KernelCache::Impl::invalidate_impl(cons
     }
     bump([&](Stats& s){ s.invalidations += static_cast<std::uint64_t>(target_ids.size()); });
   }
+  for (auto& [r, h] : retired_modules) {
+    auto ld = find_backend(r->key);
+    if (ld && ld->loader) (void)ld->loader->unload(h);
+  }
   record_event("invalidate", "by=" + std::string(invalidation_target_name(req.target)) + " count=" + std::to_string(target_ids.size()));
   return outcomes;
 }
 
-Result<void> KernelCache::Impl::evict_impl(const ArtifactId& id, bool force) {
+Result<void> KernelCache::Impl::evict_impl(const ArtifactId& id, bool force, bool device_only) {
   std::shared_ptr<ArtifactRecord> rec;
-  ArtifactState before;
+  LoadedModuleHandle handle;
+  ResidencyTier tier;
+  bool claimed = false;
   {
     std::lock_guard<std::shared_mutex> lk(mtx_);
     auto it = by_id.find(id);
     if (it == by_id.end()) return Result<void>(ErrorCode::NotFound, "artifact not found");
     rec = it->second;
+    tier = rec->tier;
+    // Nothing resident to evict (unload() concerns only the device module).
+    if (tier != ResidencyTier::DeviceResident && (device_only || tier != ResidencyTier::HostResident))
+      return Result<void>();
     if (rec->lease_count > 0 || rec->pin_count > 0) {
       if (!force) return Result<void>(ErrorCode::EvictionForbidden, "leased or pinned artifact");
       return Result<void>(ErrorCode::EvictionForbidden, "cannot evict an actively leased/pinned artifact");
     }
-    if (rec->invalidated_) { /* already terminal-ish */ }
-    before = rec->state;
-    if (can_transition(before, ArtifactState::EvictionPending)) rec->state = ArtifactState::EvictionPending;
+    if (rec->state == ArtifactState::EvictionPending)
+      return Result<void>(ErrorCode::EvictionForbidden, "eviction already in progress");
+    if (kernelcache::is_eligible(rec->state)) {
+      // Claim the record: EvictionPending is not eligible, so no lease can be
+      // granted while the module is unloaded. A previously leased record
+      // (InUse/Leasing) passes through DemotionPending.
+      if (rec->state == ArtifactState::InUse || rec->state == ArtifactState::Leasing)
+        rec->state = ArtifactState::DemotionPending;
+      rec->state = ArtifactState::EvictionPending;
+      claimed = true;
+    }
+    // Detach the module: whoever takes it out of the record unloads it, once.
+    handle = std::move(rec->native_handle);
+    rec->native_handle.reset();
   }
   // Unload outside the master lock.
   auto ld = find_backend(rec->key);
-  if (ld && ld->loader && rec->native_handle) {
-    (void)ld->loader->unload(rec->native_handle);
+  if (ld && ld->loader && handle) {
+    (void)ld->loader->unload(handle);
   }
   {
     std::lock_guard<std::shared_mutex> lk(mtx_);
-    rec->native_handle.reset();
     rec->device_footprint = 0;
     // Demote residency: if device-resident, evict device; else evict host bytes.
-    if (rec->tier == ResidencyTier::DeviceResident) {
+    if (tier == ResidencyTier::DeviceResident) {
       if (can_transition(rec->state, ArtifactState::EvictedDevice)) rec->state = ArtifactState::EvictedDevice;
       rec->tier = rec->persistent ? ResidencyTier::PersistentStorage : ResidencyTier::MetadataOnly;
-    } else if (rec->tier == ResidencyTier::HostResident) {
+    } else {
       if (can_transition(rec->state, ArtifactState::EvictedHost)) rec->state = ArtifactState::EvictedHost;
       rec->tier = rec->persistent ? ResidencyTier::PersistentStorage : ResidencyTier::MetadataOnly;
       // Free host bytes (persistent copy remains on disk).
       std::vector<std::uint8_t>().swap(rec->bytes);
       rec->desc.sizes.host_bytes = 0;
-    } else {
-      rec->tier = rec->persistent ? ResidencyTier::PersistentStorage : ResidencyTier::MetadataOnly;
     }
-    bump([&](Stats& s){ s.evictions++; });
+    if (claimed) {
+      // Eviction demotes residency; it does not retire the artifact. It stays
+      // eligible for reload from its host bytes or persistent copy. Without
+      // either (or if it was poisoned meanwhile) it is retired and rebuilt.
+      ArtifactState after =
+          (!rec->invalidated_ && !rec->corrupt_ && (!rec->bytes.empty() || rec->persistent))
+              ? ArtifactState::Persisted : ArtifactState::Retired;
+      if (can_transition(rec->state, after)) rec->state = after;
+    }
+    if (!device_only) bump([&](Stats& s){ s.evictions++; });
   }
-  record_event("evict", "id=" + id.str());
+  if (!device_only) record_event("evict", "id=" + id.str());
   return Result<void>();
 }
 
@@ -611,6 +682,9 @@ Result<ArtifactDescriptor> KernelCache::build(const KernelLookupRequest& request
   return impl_->build_impl(request, nullptr);
 }
 Result<ArtifactId> KernelCache::put(ArtifactDescriptor desc, std::vector<std::uint8_t> bytes) {
+  // The artifact is indexed under its key's canonical digest; a key that fails
+  // structural validation has no canonical identity.
+  if (!desc.key.finalize()) return Result<ArtifactId>(ErrorCode::InvalidArgument, "key not finalizable");
   if (desc.id == ArtifactId{}) desc.id = derive_artifact_id(bytes, desc.generation);
   if (desc.generation.value == 0) desc.generation = ArtifactGeneration(1);
   auto rec = impl_->make_record(desc, std::move(bytes));
@@ -632,19 +706,30 @@ Result<ValidationDescriptor> KernelCache::validate(const KernelLookupRequest& re
   }
   auto ld = impl_->find_backend(rec->key);
   if (!ld || !ld->validator) return Result<ValidationDescriptor>(ErrorCode::NotSupported, "no validator for backend");
-  // Validate outside the master lock.
-  auto res = ld->validator->validate(rec->key, rec->bytes, request.device);
-  if (res) {
+  // Validate a copy of the bytes outside the master lock: eviction may free the
+  // record's own vector meanwhile. Bytes evicted to persistent storage reload.
+  auto bytes = impl_->ensure_bytes(rec);
+  if (!bytes) return Result<ValidationDescriptor>(bytes.error().code(), bytes.error().message());
+  auto res = ld->validator->validate(rec->key, bytes.value(), request.device);
+  LoadedModuleHandle retired_module;
+  {
     std::lock_guard<std::shared_mutex> lk(impl_->mtx_);
-    rec->validated = res.value().all_passed();
-    rec->desc.validation = res.value();
-    if (rec->validated && can_transition(rec->state, ArtifactState::Valid)) rec->state = ArtifactState::Valid;
-    else if (!rec->validated && can_transition(rec->state, ArtifactState::Corrupt)) { rec->state = ArtifactState::Corrupt; rec->corrupt_ = true; }
-  } else {
-    std::lock_guard<std::shared_mutex> lk(impl_->mtx_);
-    rec->corrupt_ = true;
-    if (can_transition(rec->state, ArtifactState::Corrupt)) rec->state = ArtifactState::Corrupt;
+    if (res) {
+      rec->validated = res.value().all_passed();
+      rec->desc.validation = res.value();
+    }
+    if (res && rec->validated) {
+      if (can_transition(rec->state, ArtifactState::Valid)) rec->state = ArtifactState::Valid;
+    } else {
+      // A failed validation poisons the record even when its state (e.g. InUse)
+      // cannot move to Corrupt: leases refuse it and the last release retires
+      // it. Without leases its loaded device state is retired now.
+      rec->corrupt_ = true;
+      if (can_transition(rec->state, ArtifactState::Corrupt)) rec->state = ArtifactState::Corrupt;
+      if (rec->lease_count == 0) retired_module = take_device_state(*rec);
+    }
   }
+  if (retired_module && ld->loader) (void)ld->loader->unload(retired_module);
   return res;
 }
 
@@ -655,11 +740,16 @@ Result<ArtifactHandle> KernelCache::load(const ArtifactId& artifact) {
     auto it = impl_->by_id.find(artifact);
     if (it == impl_->by_id.end()) return Result<ArtifactHandle>(ErrorCode::NotFound, "artifact not found");
     rec = it->second;
+    // Loading hands out an executable handle: apply the same gate as a lease.
+    if (rec->invalidated_ || rec->corrupt_ || !rec->validated || !kernelcache::is_eligible(rec->state))
+      return Result<ArtifactHandle>(ErrorCode::StaleArtifact, "artifact is not eligible for loading");
   }
   DeviceDescriptor dev;
   auto pr = impl_->promote_to_tier(rec, ResidencyTier::DeviceResident, dev);
   if (!pr) return Result<ArtifactHandle>(pr.error().code(), pr.error().message());
   std::lock_guard<std::shared_mutex> lk(impl_->mtx_);
+  if (rec->invalidated_ || rec->corrupt_)
+    return Result<ArtifactHandle>(ErrorCode::StaleArtifact, "artifact invalidated while loading");
   ArtifactHandle h;
   h.id = rec->id; h.generation = rec->generation; h.load_generation = rec->load_generation;
   h.residency_generation = rec->residency_generation;
@@ -670,21 +760,9 @@ Result<ArtifactHandle> KernelCache::load(const ArtifactId& artifact) {
 }
 
 Result<void> KernelCache::unload(const ArtifactId& artifact) {
-  std::shared_ptr<ArtifactRecord> rec;
-  {
-    std::lock_guard<std::shared_mutex> lk(impl_->mtx_);
-    auto it = impl_->by_id.find(artifact);
-    if (it == impl_->by_id.end()) return Result<void>(ErrorCode::NotFound, "artifact not found");
-    rec = it->second;
-  }
-  auto ld = impl_->find_backend(rec->key);
-  if (ld && ld->loader && rec->native_handle) (void)ld->loader->unload(rec->native_handle);
-  std::lock_guard<std::shared_mutex> lk(impl_->mtx_);
-  rec->native_handle.reset();
-  rec->device_footprint = 0;
-  if (can_transition(rec->state, ArtifactState::EvictedDevice)) rec->state = ArtifactState::EvictedDevice;
-  rec->tier = rec->persistent ? ResidencyTier::PersistentStorage : ResidencyTier::MetadataOnly;
-  return Result<void>();
+  // Unloading is a device-tier eviction: a leased or pinned artifact's module is
+  // never unloaded under an executing handle, and the artifact stays reloadable.
+  return impl_->evict_impl(artifact, false, /*device_only=*/true);
 }
 
 Result<void> KernelCache::execute(const ArtifactHandle& handle, void* args, std::size_t arg_bytes) {

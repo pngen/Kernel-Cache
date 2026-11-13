@@ -23,12 +23,27 @@ struct WorkerSlot { kc_socket_t fd = KC_INVALID_SOCKET; WorkerId id; WorkerBootI
 
 static std::mutex g_wmtx;              // guards g_workers
 static std::vector<WorkerSlot> g_workers;
-static std::mutex g_dispatch_mtx;      // serializes dispatch to a shared worker socket
+// Serializes every write to a worker socket (build dispatch, epoch broadcast,
+// register ack): frames are written in two parts and must never interleave.
+static std::mutex g_dispatch_mtx;
 static std::atomic<std::uint64_t> g_epoch{1};
 static std::atomic<std::uint64_t> g_gen{1};
 static KernelCache* g_cache = nullptr;
+static std::mutex g_state_mtx;         // guards g_pending and g_built (shared by all connection threads)
 static std::set<std::string> g_pending;   // canonical keys that missed and are awaiting a build
 static std::unordered_map<std::string, std::pair<ArtifactId, ArtifactGeneration>> g_built;   // keys the coordinator has built
+
+// Forget a worker whose stream failed: close it so it is no longer dispatched
+// to or reported as registered. Caller holds g_wmtx.
+static void drop_worker_locked(kc_socket_t fd) {
+  for (auto it = g_workers.begin(); it != g_workers.end(); ++it) {
+    if (it->fd == fd) {
+      dist::TcpConnection c; c.fd = fd; c.close();
+      g_workers.erase(it);
+      return;
+    }
+  }
+}
 
 static bool dispatch_build(const std::vector<std::uint8_t>& keycan, const std::string& src,
                            const std::string& ns, const std::string& arch, const DistAuthority& auth,
@@ -48,9 +63,13 @@ static bool dispatch_build(const std::vector<std::uint8_t>& keycan, const std::s
   if (w.fd == KC_INVALID_SOCKET) { errc = static_cast<std::uint32_t>(ErrorCode::NotSupported); errm = "no worker"; return false; }
   dist::TcpConnection c; c.fd = w.fd;
   auto req = encode_build_request(auth, rid, keycan, src, ns, arch);
-  if (!c.write_frame(static_cast<std::uint16_t>(DistMsgType::BuildReq), req)) return false;
   std::uint16_t t; std::vector<std::uint8_t> pl;
-  if (!c.read_frame(t, pl) || t != static_cast<std::uint16_t>(DistMsgType::BuildResp)) return false;
+  if (!c.write_frame(static_cast<std::uint16_t>(DistMsgType::BuildReq), req) ||
+      !c.read_frame(t, pl) || t != static_cast<std::uint16_t>(DistMsgType::BuildResp)) {
+    std::lock_guard<std::mutex> lk(g_wmtx);
+    drop_worker_locked(w.fd);
+    return false;
+  }
   RequestId rr; decode_build_response(pl, rr, oid, ogen, errc, errm);
   return errc == 0;
 }
@@ -61,11 +80,22 @@ static void serve_client(dist::TcpConnection conn, std::uint16_t first_type, std
   std::vector<std::uint8_t> payload = std::move(first_payload);
   for (;;) {
     if (type == static_cast<std::uint16_t>(DistMsgType::RollEpoch)) {
-      CoordinatorEpoch e; decode_roll_epoch(payload, e);
-      g_epoch.store(e.value); g_gen.store(e.value);
-      std::lock_guard<std::mutex> lk(g_wmtx);
-      for (auto& s : g_workers) {
-        if (s.fd != KC_INVALID_SOCKET) { dist::TcpConnection wc; wc.fd = s.fd; auto rf = encode_roll_epoch(e); (void)wc.write_frame(static_cast<std::uint16_t>(DistMsgType::RollEpoch), rf); }
+      // A malformed roll is ignored, and the epoch never moves backwards: an
+      // older epoch would make previously fenced authority current again.
+      CoordinatorEpoch e;
+      if (decode_roll_epoch(payload, e)) {
+        std::lock_guard<std::mutex> dlk(g_dispatch_mtx);
+        if (e.value >= g_epoch.load()) {
+          g_epoch.store(e.value); g_gen.store(e.value);
+          std::lock_guard<std::mutex> lk(g_wmtx);
+          auto rf = encode_roll_epoch(e);
+          for (auto it = g_workers.begin(); it != g_workers.end();) {
+            dist::TcpConnection wc; wc.fd = it->fd;
+            if (it->fd != KC_INVALID_SOCKET && wc.write_frame(static_cast<std::uint16_t>(DistMsgType::RollEpoch), rf)) { ++it; continue; }
+            wc.close();
+            it = g_workers.erase(it);
+          }
+        }
       }
     } else if (type == static_cast<std::uint16_t>(DistMsgType::LookupReq)) {
       RequestId rid; std::string op; std::vector<std::uint8_t> keycan; std::string ns; std::uint8_t tier;
@@ -82,17 +112,31 @@ static void serve_client(dist::TcpConnection conn, std::uint16_t first_type, std
           req.desired_tier = ResidencyTier::HostResident; req.allow_miss_build = false; req.namespace_ = ns;
           auto lk = g_cache->lookup(req);
           std::string kh = k.value().digest_hex();
-          auto bit = g_built.find(kh);
-          if (bit != g_built.end()) { id = bit->second.first; gen = bit->second.second; outcome = 0x00; compat = 1; }
-          else if (lk.ok() && lk.value().is_hit()) { id = *lk.value().artifact; gen = *lk.value().generation; outcome = 0x00; compat = 1; }
-          else if (g_pending.count(kh)) {
+          const bool cache_hit = lk.ok() && lk.value().is_hit();
+          bool built = false, claimed = false;
+          {
+            // Connection threads share these maps. Claiming the pending entry
+            // (erase) under the lock lets exactly one connection dispatch it.
+            std::lock_guard<std::mutex> slk(g_state_mtx);
+            auto bit = g_built.find(kh);
+            if (bit != g_built.end()) { id = bit->second.first; gen = bit->second.second; built = true; }
+            else if (!cache_hit) {
+              if (g_pending.erase(kh)) claimed = true;
+              else g_pending.insert(kh);
+            }
+          }
+          if (built) { outcome = 0x00; compat = 1; }
+          else if (cache_hit) { id = *lk.value().artifact; gen = *lk.value().generation; outcome = 0x00; compat = 1; }
+          else if (claimed) {
             DistAuthority wa = *auth;
             ArtifactId bid; ArtifactGeneration bgen; std::uint32_t berr = 0; std::string bemsg;
             bool ok = dispatch_build(keycan, std::string(), ns, k.value().arch, wa, rid, bid, bgen, berr, bemsg);
-            g_pending.erase(kh);
-            if (ok) { id = bid; gen = bgen; outcome = 0x00; compat = 1; g_built[kh] = {bid, bgen}; }
-            else { outcome = 0x0F; }
-          } else { g_pending.insert(kh); outcome = 0x0B; }
+            if (ok) {
+              id = bid; gen = bgen; outcome = 0x00; compat = 1;
+              std::lock_guard<std::mutex> slk(g_state_mtx);
+              g_built[kh] = {bid, bgen};
+            } else { outcome = 0x0F; }
+          } else { outcome = 0x0B; }
         }
       }
       auto resp = encode_lookup_response(rid, outcome, id, gen, compat);
@@ -118,13 +162,23 @@ static void handle_conn(kc_socket_t sock) {
     auto reg = decode_register(payload, g);
     if (!reg) { conn.close(); return; }
     WorkerId wid = reg.value().first; WorkerBootId boot = reg.value().second;
-    {
-      std::lock_guard<std::mutex> lk(g_wmtx);
-      g_workers.push_back({sock, wid, boot});
-    }
+    // Ack before the slot is published, serialized with dispatch and epoch
+    // rolls: no BuildReq or RollEpoch frame can precede or interleave with the
+    // RegisterAck, and the acked epoch is still current when the slot appears.
+    std::lock_guard<std::mutex> dlk(g_dispatch_mtx);
     dist::TcpConnection ackconn; ackconn.fd = sock;
     auto ack = encode_register_ack(CoordinatorEpoch(g_epoch.load()), wid, 1);
-    ackconn.write_frame(static_cast<std::uint16_t>(DistMsgType::RegisterAck_C), ack);
+    if (!ackconn.write_frame(static_cast<std::uint16_t>(DistMsgType::RegisterAck_C), ack)) { conn.close(); return; }
+    {
+      std::lock_guard<std::mutex> lk(g_wmtx);
+      // A restarted worker (same WorkerId, new boot) replaces its old
+      // registration instead of leaving the dead socket registered.
+      for (auto it = g_workers.begin(); it != g_workers.end();) {
+        if (it->id == wid) { dist::TcpConnection old; old.fd = it->fd; old.close(); it = g_workers.erase(it); }
+        else ++it;
+      }
+      g_workers.push_back({sock, wid, boot});
+    }
 
     // Thread exits; the socket stays open and is owned by g_workers for dispatch.
     return;

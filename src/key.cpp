@@ -39,11 +39,18 @@ bool KernelCompatibilityKey::finalize() noexcept {
   sort_strings(codegen_flags);
   sort_pairs(specialization);
 
-  // Structural validation.
-  if (dtypes.size() != layouts.size()) return false;
-  if (!layouts.empty() && layouts.size() != rank && rank != 0) return false;
-  if (!shape.empty() && shape.size() != rank && rank != 0) return false;
-  if (!scalar_param_types.empty() && scalar_param_types.size() != rank && rank != 0) return false;
+  // Structural validation. A rejected key must not keep the digest of the fields
+  // it was copied from, or it would still compare and hash equal to that key.
+  if (dtypes.size() != layouts.size() ||
+      (!layouts.empty() && layouts.size() != rank && rank != 0) ||
+      (!shape.empty() && shape.size() != rank && rank != 0) ||
+      (!scalar_param_types.empty() && scalar_param_types.size() != rank && rank != 0)) {
+    canonical_.clear();
+    digest_ = Sha256Digest{};
+    digest_hex_.clear();
+    canonical_text_.clear();
+    return false;
+  }
 
   canonical_.clear();
   CanonicalWriter w;

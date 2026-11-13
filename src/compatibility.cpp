@@ -67,9 +67,14 @@ KernelCompatibilityDecision evaluate_compatibility(const KernelCompatibilityKey&
   KernelCompatibilityDecision d;
   const KernelCompatibilityKey* r = &req;
   const KernelCompatibilityKey* c = &cand;
-  // Ensure both are finalized before comparing digests.
-  const_cast<KernelCompatibilityKey*>(r)->finalize();
-  const_cast<KernelCompatibilityKey*>(c)->finalize();
+  // Ensure both are finalized before comparing digests. A key that fails
+  // structural validation has no canonical identity and is never compatible.
+  if (!const_cast<KernelCompatibilityKey*>(r)->finalize() ||
+      !const_cast<KernelCompatibilityKey*>(c)->finalize()) {
+    d.reason = CompatibilityReason::InvalidArtifact;
+    d.notes.push_back("key failed structural validation");
+    return d;
+  }
 
   if (r->digest() == c->digest()) {
     d.reason = CompatibilityReason::ExactCompatible;
